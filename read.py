@@ -19,7 +19,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import textwrap
 import threading
 import wave
 from dataclasses import dataclass
@@ -45,8 +44,10 @@ logging.getLogger("phonemizer").addFilter(_DropPhonemizerNoise())
 MODEL_ID = "mlx-community/Kokoro-82M-bf16"
 DEFAULT_VOICE = "af_bella"
 MAX_CHARS = 500          # target characters per synthesis chunk
-SEEK_SECONDS = 15        # how far ←/→ jump
+SEEK_BIG = 10            # j / l jump (seconds), YouTube-style
+SEEK_SMALL = 5           # ← / → jump (seconds), YouTube-style
 BLOCK = 2048             # audio frames written per loop (~85 ms at 24 kHz)
+REFRESH = 0.1            # read-along redraw interval (seconds)
 WORDS_PER_SEC = 2.5      # rough Kokoro speaking rate at speed 1.0, for estimates
 
 # Language code is derived from the first letter of the voice name.
@@ -348,6 +349,12 @@ class AudioBuffer:
                 return self.starts[idx]
             return 0
 
+    def part_length(self, idx):
+        with self.lock:
+            if 0 <= idx < len(self.parts):
+                return len(self.parts[idx])
+            return 0
+
     def get_block(self, pos, n):
         """Return (block, at_end). block is None when pos is past the
         synthesized region; at_end is True only once everything is done."""
@@ -377,14 +384,15 @@ def _fmt_time(seconds):
 
 class Player:
     """Synthesize chunks in a worker thread and play them through sounddevice,
-    with a cursor we control for pause, ±15s seek, and paragraph jumps.
+    with a cursor we control for pause, seeking, and paragraph jumps. The
+    now-playing paragraph is redrawn in place with a moving word highlight.
 
     A single Ctrl-C (or 'q') sets the quit flag; the audio stream is stopped and
     every thread is a daemon, so nothing is left running on exit.
     """
 
-    HELP = ("[space] play/pause   [←/→] ∓15s   [j/k] prev/next ¶   "
-            "[g] start   [q] quit")
+    HELP = ("[space/k] play/pause   [j/l] ∓10s   [←/→] ∓5s   "
+            "[ [ / ] ] prev/next ¶   [0] restart   [q] quit")
 
     def __init__(self, model, chunks, voice, speed, lang_code, est_total_sec):
         self.model = model
@@ -401,8 +409,10 @@ class Player:
         self.at_end = False
         self.quit = threading.Event()
         self.started = threading.Event()   # first chunk ready (or nothing to do)
-        self.out_lock = threading.Lock()   # serialize status line vs. log lines
+        self.out_lock = threading.Lock()   # serialize all terminal writes
         self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        self._above = 0                    # lines above cursor in the live region
+        self._para_lines = 0               # current paragraph line count
 
     # --- cursor helpers ----------------------------------------------------- #
     def _get_cursor(self):
@@ -472,25 +482,27 @@ class Player:
                 stream.stop()
                 stream.close()
 
-    # --- key handling ------------------------------------------------------- #
+    # --- key handling (YouTube-style) --------------------------------------- #
     def _handle_key(self, key):
-        if key in (" ",):
+        if key in (" ", "k"):                     # play / pause
             self.paused = not self.paused
             self.at_end = False
-        elif key in ("q", "Q"):
+        elif key in ("q", "Q"):                   # quit
             self.quit.set()
-        elif key in ("RIGHT", "l"):
-            self._seek_to(self._get_cursor() + SEEK_SECONDS * self.sr)
-        elif key in ("LEFT", "h"):
-            self._seek_to(self._get_cursor() - SEEK_SECONDS * self.sr)
-        elif key in ("k",):                       # next paragraph
+        elif key == "l":                          # forward 10s
+            self._seek_to(self._get_cursor() + SEEK_BIG * self.sr)
+        elif key == "j":                          # back 10s
+            self._seek_to(self._get_cursor() - SEEK_BIG * self.sr)
+        elif key == "RIGHT":                      # forward 5s
+            self._seek_to(self._get_cursor() + SEEK_SMALL * self.sr)
+        elif key == "LEFT":                       # back 5s
+            self._seek_to(self._get_cursor() - SEEK_SMALL * self.sr)
+        elif key == "]":                          # next paragraph
             self._jump_paragraph(+1)
-        elif key in ("j",):                       # previous paragraph
+        elif key == "[":                          # previous paragraph
             self._jump_paragraph(-1)
-        elif key in ("g", "0"):
+        elif key == "0":                          # restart
             self._seek_to(0)
-        elif key in ("G",):
-            self._seek_to(self.buf.synth_total())
 
     def _jump_paragraph(self, direction):
         idx = self.buf.chunk_at(self._get_cursor()) + direction
@@ -538,24 +550,95 @@ class Player:
     def _term_width():
         return min(shutil.get_terminal_size((80, 24)).columns, 100)
 
-    def _render_segment(self, seg):
-        """Format the now-playing segment for the read-along display."""
-        width = self._term_width()
-        if seg.kind == "heading":
-            body = textwrap.fill(seg.text, width)
-            return f"\n\x1b[1;36m{body}\x1b[0m"          # blank line + bold cyan
-        if seg.kind == "list":
-            body = textwrap.fill(seg.text, max(20, width - 4),
-                                 subsequent_indent="    ")
-            return f"  \x1b[33m•\x1b[0m {body}"
-        if seg.kind == "code":
-            return "\x1b[2m[code block omitted]\x1b[0m"
-        return textwrap.fill(seg.text, width)
+    @staticmethod
+    def _wrap_words(words, width, hl, indent=""):
+        """Greedy word-wrap to `width`, reverse-video the word at index `hl`.
+        ANSI codes are added only after width is measured, so they don't
+        affect wrapping."""
+        lines, line, vis, first = [], indent, len(indent), True
+        for i, w in enumerate(words):
+            if not first and vis + 1 + len(w) > width:
+                lines.append(line)
+                line, vis, first = indent, len(indent), True
+            shown = f"\x1b[7m{w}\x1b[0m" if i == hl else w
+            line += shown if first else " " + shown
+            vis += len(w) if first else 1 + len(w)
+            first = False
+        lines.append(line)
+        return lines
 
-    def _emit_status(self):
+    def _segment_lines(self, seg, hl):
+        """Render a segment to a list of terminal lines (with styling)."""
+        width = self._term_width()
+        if seg.kind == "code":
+            return ["\x1b[2m[code block omitted]\x1b[0m"]
+        if seg.kind == "heading":
+            lines = self._wrap_words(seg.text.split(), width, None)
+            return [f"\x1b[1;36m{l}\x1b[0m" for l in lines]      # bold cyan
+        if seg.kind == "list":
+            wl = self._wrap_words(seg.text.split(), max(20, width - 4), None)
+            return [(f"  \x1b[33m•\x1b[0m {l}" if j == 0 else f"    {l}")
+                    for j, l in enumerate(wl)]
+        return self._wrap_words(seg.text.split(), width, hl)   # paragraph
+
+    def _current_word(self, idx):
+        """Estimate which word index is playing, by elapsed fraction of the
+        paragraph's audio (Kokoro gives no real per-word timestamps)."""
+        seg = self.chunks[idx]
+        nwords = len(seg.text.split())
+        if nwords == 0 or seg.kind != "para":
+            return None
+        length = self.buf.part_length(idx)
+        if length <= 0:
+            return 0
+        frac = (self._get_cursor() - self.buf.chunk_start(idx)) / length
+        return max(0, min(nwords - 1, int(frac * nwords)))
+
+    def _status_line(self):
+        pos = self._get_cursor()
+        cur = pos / self.sr
+        if self.buf.done:
+            total = self.buf.synth_total() / self.sr
+        else:
+            total = max(self.est_total_sec, cur)
+        frac = 0.0 if total <= 0 else max(0.0, min(1.0, cur / total))
+        fill = int(frac * 24)
+        bar = "█" * fill + "░" * (24 - fill)
+        state = "End    " if self.at_end else ("Paused " if self.paused
+                                               else "Playing")
+        idx = self.buf.chunk_at(pos) + 1
+        tail = "" if self.buf.done else " +"   # synthesis still running
+        return (f"{'❚❚' if self.paused else '▶'}  {state}  "
+                f"¶ {idx}/{len(self.chunks)}  {bar}  "
+                f"{_fmt_time(cur)} / {_fmt_time(total)}{tail}")
+
+    def _paint(self, idx):
+        """Redraw the live region (current paragraph + status) in place."""
+        para = self._segment_lines(self.chunks[idx], self._current_word(idx))
+        lines = para + [self._status_line()]
         with self.out_lock:
-            sys.stdout.write("\r\x1b[K" + self._status_line())
+            if self._above:
+                sys.stdout.write(f"\x1b[{self._above}A")  # up to region top
+            if len(para) != self._para_lines:             # layout changed
+                sys.stdout.write("\x1b[J")                # full clear
+            body = "".join(f"\r\x1b[K{l}\n" for l in lines[:-1])
+            sys.stdout.write(body + f"\r\x1b[K{lines[-1]}")
             sys.stdout.flush()
+        self._above = len(para)
+        self._para_lines = len(para)
+
+    def _commit(self, idx):
+        """Leave a finished paragraph cleanly in the scrollback (no highlight,
+        no frozen status line) before the next one becomes live."""
+        para = self._segment_lines(self.chunks[idx], None)
+        with self.out_lock:
+            if self._above:
+                sys.stdout.write(f"\x1b[{self._above}A")
+            sys.stdout.write("\x1b[J")
+            sys.stdout.write("".join(f"{l}\n" for l in para))
+            sys.stdout.flush()
+        self._above = 0
+        self._para_lines = 0
 
     def _log(self, text):
         with self.out_lock:
@@ -595,22 +678,24 @@ class Player:
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         print(self.HELP)
+        last_idx = -1
         try:
             tty.setcbreak(fd)            # cbreak keeps Ctrl-C working as SIGINT
             kb = threading.Thread(target=self._keyboard, args=(fd,), daemon=True)
             kb.start()
-            last_idx = -1
             while not self.quit.is_set():
                 idx = self.buf.chunk_at(self._get_cursor())
                 if idx != last_idx:
+                    if last_idx != -1:
+                        self._commit(last_idx)   # finished paragraph -> scrollback
                     last_idx = idx
-                    self._log(self._render_segment(self.chunks[idx]))
-                self._emit_status()
-                self.quit.wait(0.15)
+                self._paint(idx)                 # live region with word highlight
+                self.quit.wait(REFRESH)
         finally:
             termios.tcsetattr(fd, termios.TCSANOW, old)
+            if last_idx != -1:
+                self._commit(last_idx)           # leave last paragraph clean
             with self.out_lock:
-                sys.stdout.write("\r\x1b[K\n")
                 sys.stdout.flush()
 
     def _run_plain(self):

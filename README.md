@@ -56,28 +56,34 @@ terminal), you get a live control bar:
 ```
 
 It shows play/pause state, which paragraph you're on (`¶ 7/42`), a progress
-bar, and elapsed / total time. As playback moves into each paragraph, that
-paragraph's text is printed above the bar — word-wrapped to your terminal — so
-you can follow along, like a teleprompter. A trailing `+` on the time means the
-rest is still being synthesized in the background.
+bar, and elapsed / total time. The now-playing paragraph is shown above the bar,
+word-wrapped to your terminal, and the **current word is highlighted** as it's
+spoken — a karaoke-style read-along. A trailing `+` on the time means the rest
+is still being synthesized in the background.
 
-For web pages, light structure is preserved in that read-along view: **headings**
-are highlighted and **list items** are bulleted. Code blocks read terribly
-aloud, so they're skipped — replaced by a short `[code block omitted]` notice
-(spoken and shown) so you always know something was there.
+For web pages, light structure is preserved: **headings** are highlighted and
+**list items** are bulleted. Code blocks read terribly aloud, so they're
+skipped — replaced by a short `[code block omitted]` notice (spoken and shown)
+so you always know something was there.
+
+Keys follow YouTube's conventions:
 
 | Key | Action |
 |-----|--------|
-| `space` | play / pause |
-| `←` / `→` | seek back / forward 15 s |
-| `j` / `k` | previous / next paragraph |
-| `g` (or `0`) | jump to the start |
-| `G` | jump to the end |
+| `space` or `k` | play / pause |
+| `j` / `l` | seek back / forward 10 s |
+| `←` / `→` | seek back / forward 5 s |
+| `[` / `]` | previous / next paragraph |
+| `0` | restart from the beginning |
 | `q` or `Ctrl-C` | quit |
 
 Backward seeks are always instant; forward seeks go as far as has been
 synthesized so far (synthesis quickly runs ahead of playback). Everything stays
 in memory — playback never writes to disk.
+
+> The word highlight is positioned by elapsed time within each paragraph (Kokoro
+> doesn't emit real per-word timestamps), so it tracks closely but isn't sample-
+> exact.
 
 > Piping/redirecting output (no TTY) falls back to plain streaming with
 > `chunk N/M` progress and no key controls.
