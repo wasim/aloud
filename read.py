@@ -9,17 +9,19 @@ Everything runs locally; after the first model download it works fully offline.
 """
 
 import argparse
+import bisect
 import contextlib
 import logging
 import os
-import queue
 import re
+import select
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import wave
+
+import numpy as np
 
 # Quiet the noisy third-party startup chatter before anything imports them.
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
@@ -33,6 +35,8 @@ logging.getLogger("phonemizer").setLevel(logging.ERROR)
 MODEL_ID = "mlx-community/Kokoro-82M-bf16"
 DEFAULT_VOICE = "af_bella"
 MAX_CHARS = 500          # target characters per synthesis chunk
+SEEK_SECONDS = 15        # how far ←/→ jump
+BLOCK = 2048             # audio frames written per loop (~85 ms at 24 kHz)
 WORDS_PER_SEC = 2.5      # rough Kokoro speaking rate at speed 1.0, for estimates
 
 # Language code is derived from the first letter of the voice name.
@@ -200,7 +204,6 @@ def load_model_quiet():
 
 def synth(model, text, voice, speed, lang_code):
     """Return (mono float32 numpy audio, sample_rate) for one chunk."""
-    import numpy as np
     results = list(model.generate(text=text, voice=voice, speed=speed,
                                   lang_code=lang_code))
     if not results:
@@ -210,7 +213,6 @@ def synth(model, text, voice, speed, lang_code):
 
 
 def write_wav(path, audio, sr):
-    import numpy as np
     pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
@@ -220,100 +222,319 @@ def write_wav(path, audio, sr):
 
 
 # --------------------------------------------------------------------------- #
-# Playback (streaming) with clean Ctrl-C handling
+# Streaming playback with interactive controls
 # --------------------------------------------------------------------------- #
-class Player:
-    """Synthesize chunks in a worker thread, play them in order via afplay.
+class AudioBuffer:
+    """A growing in-memory stream of synthesized chunks.
 
-    A single Ctrl-C sets a stop flag, kills the current afplay child, and
-    tears everything down so no orphaned afplay/python processes survive.
+    The synth worker appends chunk audio as it's produced; the playback thread
+    reads arbitrary sample windows (for seeking). All audio lives in RAM — a
+    15-minute article is well under 100 MB at 24 kHz mono float32 — so seeking
+    backward is always instant and playback never touches disk.
     """
 
-    def __init__(self, model, chunks, voice, speed, lang_code):
+    def __init__(self):
+        self.parts = []        # list[np.ndarray]
+        self.starts = []       # cumulative start sample of each part
+        self.total = 0         # samples synthesized so far
+        self.done = False      # all chunks synthesized
+        self.lock = threading.Lock()
+
+    def append(self, arr):
+        with self.lock:
+            self.starts.append(self.total)
+            self.parts.append(arr)
+            self.total += len(arr)
+
+    def mark_done(self):
+        with self.lock:
+            self.done = True
+
+    def synth_total(self):
+        with self.lock:
+            return self.total
+
+    def num_chunks(self):
+        with self.lock:
+            return len(self.parts)
+
+    def chunk_at(self, pos):
+        with self.lock:
+            if not self.starts:
+                return 0
+            i = bisect.bisect_right(self.starts, pos) - 1
+            return max(0, min(i, len(self.parts) - 1))
+
+    def chunk_start(self, idx):
+        with self.lock:
+            if 0 <= idx < len(self.starts):
+                return self.starts[idx]
+            return 0
+
+    def get_block(self, pos, n):
+        """Return (block, at_end). block is None when pos is past the
+        synthesized region; at_end is True only once everything is done."""
+        with self.lock:
+            if pos >= self.total:
+                return None, self.done
+            out, need, p = [], n, pos
+            i = bisect.bisect_right(self.starts, p) - 1
+            while need > 0 and 0 <= i < len(self.parts):
+                local = p - self.starts[i]
+                part = self.parts[i]
+                if 0 <= local < len(part):
+                    take = part[local:local + need]
+                    out.append(take)
+                    need -= len(take)
+                    p += len(take)
+                i += 1
+            if not out:
+                return None, self.done
+            return (out[0] if len(out) == 1 else np.concatenate(out)), False
+
+
+def _fmt_time(seconds):
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _preview(text, width=72):
+    text = " ".join(text.split())
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+class Player:
+    """Synthesize chunks in a worker thread and play them through sounddevice,
+    with a cursor we control for pause, ±15s seek, and paragraph jumps.
+
+    A single Ctrl-C (or 'q') sets the quit flag; the audio stream is stopped and
+    every thread is a daemon, so nothing is left running on exit.
+    """
+
+    HELP = ("[space] play/pause   [←/→] ∓15s   [j/k] prev/next ¶   "
+            "[g] start   [q] quit")
+
+    def __init__(self, model, chunks, voice, speed, lang_code, est_total_sec):
         self.model = model
         self.chunks = chunks
         self.voice = voice
         self.speed = speed
         self.lang_code = lang_code
-        self.stop = threading.Event()
-        self.q = queue.Queue(maxsize=2)
-        self.proc = None
-        self.proc_lock = threading.Lock()
-        self.tmpdir = tempfile.mkdtemp(prefix="kokoro-reader-")
+        self.est_total_sec = est_total_sec
+        self.sr = 24000
+        self.buf = AudioBuffer()
+        self.cursor = 0
+        self.cursor_lock = threading.Lock()
+        self.paused = False
+        self.at_end = False
+        self.quit = threading.Event()
+        self.started = threading.Event()   # first chunk ready (or nothing to do)
+        self.out_lock = threading.Lock()   # serialize status line vs. log lines
+        self.interactive = sys.stdin.isatty() and sys.stdout.isatty()
 
-    def _producer(self):
-        for i, chunk in enumerate(self.chunks):
-            if self.stop.is_set():
+    # --- cursor helpers ----------------------------------------------------- #
+    def _get_cursor(self):
+        with self.cursor_lock:
+            return self.cursor
+
+    def _set_cursor(self, pos):
+        with self.cursor_lock:
+            self.cursor = max(0, pos)
+
+    def _seek_to(self, pos):
+        end = max(0, self.buf.synth_total() - 1)
+        self._set_cursor(min(max(0, pos), end))
+        self.at_end = False
+        self.paused = False
+
+    # --- worker threads ----------------------------------------------------- #
+    def _synth_worker(self):
+        for chunk in self.chunks:
+            if self.quit.is_set():
                 break
             audio, sr = synth(self.model, chunk, self.voice, self.speed,
                               self.lang_code)
-            if self.stop.is_set() or audio is None:
+            if self.quit.is_set():
                 break
-            wav = os.path.join(self.tmpdir, f"chunk_{i:05d}.wav")
-            write_wav(wav, audio, sr)
-            # put with timeout so we re-check stop instead of blocking forever
-            while not self.stop.is_set():
-                try:
-                    self.q.put((i, wav), timeout=0.3)
-                    break
-                except queue.Full:
-                    continue
-        self.q.put(None)  # sentinel: no more chunks
+            if audio is not None:
+                self.sr = sr
+                self.buf.append(audio.astype(np.float32))
+                self.started.set()
+        self.buf.mark_done()
+        self.started.set()
 
-    def _kill_current(self):
-        with self.proc_lock:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-            self.proc = None
-
-    def _play(self, wav):
-        with self.proc_lock:
-            if self.stop.is_set():
-                return
-            self.proc = subprocess.Popen(["afplay", wav],
-                                         stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL)
-        self.proc.wait()
-
-    def run(self):
-        worker = threading.Thread(target=self._producer, daemon=True)
-        worker.start()
-        n = len(self.chunks)
+    def _playback(self):
+        import sounddevice as sd
+        self.started.wait()
+        silence = np.zeros(BLOCK, dtype=np.float32)
         try:
-            while True:
-                item = self.q.get()
-                if item is None:
-                    break
-                i, wav = item
-                print(f"\r▶ chunk {i + 1}/{n}", end="", flush=True)
-                self._play(wav)
-                with contextlib.suppress(OSError):
-                    os.remove(wav)
-            print("\rDone." + " " * 20)
-        except KeyboardInterrupt:
-            print("\nStopping…")
+            stream = sd.OutputStream(samplerate=self.sr, channels=1,
+                                     dtype="float32", blocksize=BLOCK)
+            stream.start()
+        except Exception as e:
+            self.quit.set()
+            self._log(f"audio output failed: {e}")
+            return
+        try:
+            while not self.quit.is_set():
+                if self.paused:
+                    stream.write(silence)
+                    continue
+                block, at_end = self.buf.get_block(self._get_cursor(), BLOCK)
+                if block is None:
+                    if at_end:
+                        self.at_end = True
+                        self.paused = True
+                    else:
+                        stream.write(silence)   # underrun: wait for synth
+                    continue
+                stream.write(block)
+                with self.cursor_lock:
+                    self.cursor += len(block)
         finally:
-            self.stop.set()
-            self._kill_current()
-            self._drain_and_cleanup(worker)
+            with contextlib.suppress(Exception):
+                stream.stop()
+                stream.close()
 
-    def _drain_and_cleanup(self, worker):
-        # free queue slots so a blocked producer can notice stop and exit
-        with contextlib.suppress(queue.Empty):
-            while True:
-                self.q.get_nowait()
-        worker.join(timeout=2)
-        import shutil
-        with contextlib.suppress(Exception):
-            shutil.rmtree(self.tmpdir)
+    # --- key handling ------------------------------------------------------- #
+    def _handle_key(self, key):
+        if key in (" ",):
+            self.paused = not self.paused
+            self.at_end = False
+        elif key in ("q", "Q"):
+            self.quit.set()
+        elif key in ("RIGHT", "l"):
+            self._seek_to(self._get_cursor() + SEEK_SECONDS * self.sr)
+        elif key in ("LEFT", "h"):
+            self._seek_to(self._get_cursor() - SEEK_SECONDS * self.sr)
+        elif key in ("k",):                       # next paragraph
+            self._jump_paragraph(+1)
+        elif key in ("j",):                       # previous paragraph
+            self._jump_paragraph(-1)
+        elif key in ("g", "0"):
+            self._seek_to(0)
+        elif key in ("G",):
+            self._seek_to(self.buf.synth_total())
+
+    def _jump_paragraph(self, direction):
+        idx = self.buf.chunk_at(self._get_cursor()) + direction
+        idx = max(0, min(idx, self.buf.num_chunks() - 1))
+        self._seek_to(self.buf.chunk_start(idx))
+
+    def _read_key(self, fd):
+        if not select.select([fd], [], [], 0.2)[0]:
+            return None
+        ch = os.read(fd, 1)
+        if ch == b"\x1b":                         # escape: maybe an arrow key
+            if not select.select([fd], [], [], 0.05)[0]:
+                return "ESC"
+            seq = os.read(fd, 2)
+            return {b"[C": "RIGHT", b"[D": "LEFT",
+                    b"[A": "UP", b"[B": "DOWN"}.get(seq)
+        return ch.decode("utf-8", "ignore") or None
+
+    def _keyboard(self, fd):
+        while not self.quit.is_set():
+            key = self._read_key(fd)
+            if key:
+                self._handle_key(key)
+
+    # --- rendering ---------------------------------------------------------- #
+    def _status_line(self):
+        pos = self._get_cursor()
+        cur = pos / self.sr
+        if self.buf.done:
+            total = self.buf.synth_total() / self.sr
+        else:
+            total = max(self.est_total_sec, cur)
+        frac = 0.0 if total <= 0 else max(0.0, min(1.0, cur / total))
+        fill = int(frac * 24)
+        bar = "█" * fill + "░" * (24 - fill)
+        state = "End    " if self.at_end else ("Paused " if self.paused
+                                               else "Playing")
+        idx = self.buf.chunk_at(pos) + 1
+        tail = "" if self.buf.done else " +"   # synthesis still running
+        return (f"{'❚❚' if self.paused else '▶'}  {state}  "
+                f"¶ {idx}/{len(self.chunks)}  {bar}  "
+                f"{_fmt_time(cur)} / {_fmt_time(total)}{tail}")
+
+    def _emit_status(self):
+        with self.out_lock:
+            sys.stdout.write("\r\x1b[K" + self._status_line())
+            sys.stdout.flush()
+
+    def _log(self, text):
+        with self.out_lock:
+            sys.stdout.write("\r\x1b[K" + text + "\n")
+            sys.stdout.flush()
+
+    # --- run ---------------------------------------------------------------- #
+    def run(self):
+        # A single Ctrl-C just sets the quit flag; every loop below checks it
+        # and tears down. (More reliable than catching KeyboardInterrupt out of
+        # a blocking Event.wait, which can be missed.)
+        prev_sigint = signal.signal(signal.SIGINT, lambda *_: self.quit.set())
+        worker = threading.Thread(target=self._synth_worker, daemon=True)
+        play = threading.Thread(target=self._playback, daemon=True)
+        worker.start()
+        print("Synthesizing… audio starts in a moment.")
+        # Wait for the first chunk (or empty finish), staying responsive to quit.
+        while not self.started.is_set() and not self.quit.is_set():
+            self.started.wait(0.1)
+        try:
+            if self.quit.is_set():
+                return
+            play.start()
+            if self.interactive:
+                self._run_interactive()
+            else:
+                self._run_plain()
+        finally:
+            self.quit.set()
+            signal.signal(signal.SIGINT, prev_sigint)
+            play.join(timeout=2)
+            worker.join(timeout=2)
+
+    def _run_interactive(self):
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        print(self.HELP)
+        try:
+            tty.setcbreak(fd)            # cbreak keeps Ctrl-C working as SIGINT
+            kb = threading.Thread(target=self._keyboard, args=(fd,), daemon=True)
+            kb.start()
+            last_idx = -1
+            while not self.quit.is_set():
+                idx = self.buf.chunk_at(self._get_cursor())
+                if idx != last_idx:
+                    last_idx = idx
+                    self._log(f"¶ {idx + 1}/{len(self.chunks)}  "
+                              f"{_preview(self.chunks[idx])}")
+                self._emit_status()
+                self.quit.wait(0.15)
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, old)
+            with self.out_lock:
+                sys.stdout.write("\r\x1b[K\n")
+                sys.stdout.flush()
+
+    def _run_plain(self):
+        # No TTY (piped/redirected): just stream to the end with chunk progress.
+        last_idx = -1
+        while not self.quit.is_set():
+            idx = self.buf.chunk_at(self._get_cursor())
+            if idx != last_idx:
+                last_idx = idx
+                print(f"chunk {idx + 1}/{len(self.chunks)}", flush=True)
+            if self.at_end:
+                print("Done.", flush=True)
+                break
+            self.quit.wait(0.2)
 
 
 def save_to_file(model, chunks, voice, speed, lang_code, out_path):
-    import numpy as np
     n = len(chunks)
     pieces, sr = [], None
     try:
@@ -469,7 +690,8 @@ def main():
     if args.save:
         save_to_file(model, chunks, args.voice, args.speed, lang_code, args.save)
     else:
-        Player(model, chunks, args.voice, args.speed, lang_code).run()
+        Player(model, chunks, args.voice, args.speed, lang_code,
+               est_sec).run()
 
 
 if __name__ == "__main__":

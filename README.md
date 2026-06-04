@@ -41,8 +41,40 @@ shadowed by a PATH executable).
 
 It **streams**: text is split into sentence/paragraph chunks and synthesized +
 played chunk by chunk, so audio starts within a second or two of the model
-loading instead of after the whole article. Progress shows as `▶ chunk 3/40`,
-and the estimated length/chunk count is printed up front.
+loading instead of after the whole article. The estimated length and chunk
+count are printed up front.
+
+---
+
+## Playback controls (interactive)
+
+When you play to your speakers (i.e. not `--save`, and you're in a real
+terminal), you get a live control bar:
+
+```
+▶  Playing   ¶ 7/42   ████████░░░░░░░░░░░░░░░░   3:48 / 12:10
+```
+
+It shows play/pause state, which paragraph you're on (`¶ 7/42`), a progress
+bar, and elapsed / total time. As playback moves into each new paragraph, that
+paragraph's text is printed above the bar so you can follow along. A trailing
+`+` on the time means the rest is still being synthesized in the background.
+
+| Key | Action |
+|-----|--------|
+| `space` | play / pause |
+| `←` / `→` | seek back / forward 15 s |
+| `j` / `k` | previous / next paragraph |
+| `g` (or `0`) | jump to the start |
+| `G` | jump to the end |
+| `q` or `Ctrl-C` | quit |
+
+Backward seeks are always instant; forward seeks go as far as has been
+synthesized so far (synthesis quickly runs ahead of playback). Everything stays
+in memory — playback never writes to disk.
+
+> Piping/redirecting output (no TTY) falls back to plain streaming with
+> `chunk N/M` progress and no key controls.
 
 ---
 
@@ -148,19 +180,19 @@ the model, not a bug in this tool.
 
 ## Stopping it / checking nothing is left running
 
-A **single Ctrl-C** immediately stops synthesis *and* playback, kills the child
-audio process, and exits cleanly — no orphaned `afplay` or `python` processes.
+A **single Ctrl-C** (or `q`) immediately stops synthesis *and* playback and
+exits cleanly — no orphaned `python` processes, no audio left playing, and your
+terminal is restored to normal.
 
 To double-check nothing is left running:
 
 ```sh
-pgrep -fl "mlx_audio|afplay|read.py"     # list anything still alive (should be empty)
+pgrep -fl "mlx_audio|read.py"     # list anything still alive (should be empty)
 ```
 
 If you ever need to force-kill (e.g. after a terminal crash):
 
 ```sh
-pkill -f afplay
 pkill -f read.py
 ```
 
@@ -168,14 +200,17 @@ pkill -f read.py
 
 ## How it stays kill-safe
 
-- Chunks are synthesized in a background worker thread and played in order via
-  `afplay` subprocesses.
-- The currently playing `afplay` PID is tracked; on Ctrl-C it is `terminate()`d
-  (then `kill()`ed if needed).
-- The worker thread is a daemon and watches a stop flag, so it can't outlive the
-  main process or keep the GPU busy after you quit.
-- Temporary WAV files are written under a per-run temp dir that is removed on
-  exit.
+- Audio plays through an in-process [`sounddevice`](https://python-sounddevice.readthedocs.io/)
+  stream (PortAudio) — there is no external `afplay`/player subprocess to orphan.
+- Ctrl-C is handled by setting a single `quit` flag that every loop checks, so
+  shutdown is deterministic (more reliable than racing a `KeyboardInterrupt`
+  out of a blocking wait).
+- The synth, playback, and keyboard threads are all daemons watching that flag,
+  so none can outlive the main process or keep the GPU/audio busy after you quit.
+- The terminal is put into cbreak mode for single-key controls and always
+  restored on exit (even on crash), via a `finally` block.
+- Audio is held in memory and streamed straight to the device — no temp files
+  to clean up.
 
 ---
 
