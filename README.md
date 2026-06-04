@@ -56,9 +56,15 @@ terminal), you get a live control bar:
 ```
 
 It shows play/pause state, which paragraph you're on (`¶ 7/42`), a progress
-bar, and elapsed / total time. As playback moves into each new paragraph, that
-paragraph's text is printed above the bar so you can follow along. A trailing
-`+` on the time means the rest is still being synthesized in the background.
+bar, and elapsed / total time. As playback moves into each paragraph, that
+paragraph's text is printed above the bar — word-wrapped to your terminal — so
+you can follow along, like a teleprompter. A trailing `+` on the time means the
+rest is still being synthesized in the background.
+
+For web pages, light structure is preserved in that read-along view: **headings**
+are highlighted and **list items** are bulleted. Code blocks read terribly
+aloud, so they're skipped — replaced by a short `[code block omitted]` notice
+(spoken and shown) so you always know something was there.
 
 | Key | Action |
 |-----|--------|

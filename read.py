@@ -15,11 +15,14 @@ import logging
 import os
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import wave
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -29,8 +32,15 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 # espeak's phonemizer emits frequent harmless "words count mismatch" warnings
-# on the espeak-ng fallback path; keep the console clean.
-logging.getLogger("phonemizer").setLevel(logging.ERROR)
+# on the espeak-ng fallback path. It resets its own logger level every time a
+# backend is created, so a plain setLevel() gets clobbered — attach a filter
+# (filters survive setLevel/handler resets) that drops anything below ERROR.
+class _DropPhonemizerNoise(logging.Filter):
+    def filter(self, record):
+        return record.levelno >= logging.ERROR
+
+
+logging.getLogger("phonemizer").addFilter(_DropPhonemizerNoise())
 
 MODEL_ID = "mlx-community/Kokoro-82M-bf16"
 DEFAULT_VOICE = "af_bella"
@@ -62,8 +72,11 @@ def text_from_url(url):
     downloaded = trafilatura.fetch_url(url)
     if not downloaded:
         err(f"could not fetch URL: {url}")
+    # Keep light markdown (headings, lists, emphasis) so we can show structure
+    # on screen; it's stripped back to clean text before synthesis.
     text = trafilatura.extract(
-        downloaded, include_comments=False, include_tables=False
+        downloaded, include_comments=False, include_tables=False,
+        include_formatting=True,
     )
     if not text or not text.strip():
         err(f"no readable article text found at: {url}")
@@ -124,13 +137,32 @@ def text_from_clipboard():
 
 
 # --------------------------------------------------------------------------- #
-# Chunking
+# Chunking into typed segments
 # --------------------------------------------------------------------------- #
+@dataclass
+class Segment:
+    """One unit of synthesis. `text` is the clean string we read aloud; `kind`
+    and `level` drive how it's rendered on screen as it plays."""
+    text: str
+    kind: str = "para"      # "para" | "heading" | "list"
+    level: int = 0          # heading depth (1=#, 2=##, …)
+
+
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[]?[A-Z0-9])")
 
 
 def split_sentences(paragraph):
     return [s for s in _SENT_SPLIT.split(paragraph) if s.strip()]
+
+
+def strip_inline(s):
+    """Remove markdown inline markers so they aren't spoken or shown literally."""
+    s = re.sub(r"`+([^`]*)`+", r"\1", s)               # `code`
+    s = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", s)      # [text](url) -> text
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)            # **bold**
+    s = re.sub(r"(?<!\*)\*(?!\*)([^*]+)\*(?!\*)", r"\1", s)  # *italic*
+    s = re.sub(r"__([^_]+)__", r"\1", s)                # __bold__
+    return " ".join(s.split())
 
 
 def hard_wrap(sentence, limit):
@@ -160,31 +192,76 @@ def hard_wrap(sentence, limit):
     return pieces
 
 
-def chunk_text(text, limit=MAX_CHARS):
-    """Split text into synthesis chunks, never breaking mid-sentence."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    paragraphs = re.split(r"\n\s*\n+", text)
-    chunks, buf = [], ""
-    for para in paragraphs:
-        para = " ".join(para.split())
-        if not para:
-            continue
-        for sent in split_sentences(para):
-            for piece in hard_wrap(sent, limit):
-                if not buf:
-                    buf = piece
-                elif len(buf) + len(piece) + 1 <= limit:
-                    buf = f"{buf} {piece}"
-                else:
-                    chunks.append(buf)
-                    buf = piece
-        # paragraph boundary: flush so we don't run sentences together
-        if buf:
-            chunks.append(buf)
-            buf = ""
+def split_paragraph(para, limit=MAX_CHARS):
+    """Greedily merge sentences of one paragraph into <=limit-char pieces,
+    never breaking mid-sentence (over-long sentences are hard-wrapped)."""
+    pieces, buf = [], ""
+    for sent in split_sentences(para):
+        for piece in hard_wrap(sent, limit):
+            if not buf:
+                buf = piece
+            elif len(buf) + len(piece) + 1 <= limit:
+                buf = f"{buf} {piece}"
+            else:
+                pieces.append(buf)
+                buf = piece
     if buf:
-        chunks.append(buf)
-    return chunks
+        pieces.append(buf)
+    return pieces
+
+
+def segment_text(text, is_markdown, limit=MAX_CHARS):
+    """Turn extracted text into a list of typed Segments.
+
+    Markdown input (from web pages) keeps heading/list structure for display;
+    plain input (PDF/clipboard/--text) becomes paragraphs. In both cases the
+    spoken text has markdown markers stripped and long paragraphs are split.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    segments = []
+
+    def add_paragraph(para):
+        clean = strip_inline(" ".join(para.split()))
+        for piece in split_paragraph(clean, limit):
+            segments.append(Segment(piece, "para"))
+
+    if not is_markdown:
+        for para in re.split(r"\n\s*\n+", text):
+            if para.strip():
+                add_paragraph(para)
+        return segments
+
+    in_fence = False
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            # Code blocks read terribly aloud; skip the body but leave a short
+            # spoken/shown notice so nothing disappears without the listener
+            # knowing it was there.
+            if not in_fence:
+                segments.append(Segment("Code block omitted.", "code"))
+            in_fence = not in_fence
+            continue
+        if not stripped or in_fence:
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)", stripped)
+        if m:
+            heading = strip_inline(m.group(2))
+            if heading:
+                segments.append(Segment(heading, "heading", len(m.group(1))))
+            continue
+        m = re.match(r"^[-*+]\s+(.*)", stripped)
+        if m:
+            item = strip_inline(m.group(1))
+            if not item:
+                continue
+            # a long bullet still gets split, but every piece stays a "list"
+            for piece in split_paragraph(item, limit):
+                segments.append(Segment(piece, "list"))
+            continue
+        add_paragraph(stripped)
+    return segments
 
 
 # --------------------------------------------------------------------------- #
@@ -298,11 +375,6 @@ def _fmt_time(seconds):
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
-def _preview(text, width=72):
-    text = " ".join(text.split())
-    return text if len(text) <= width else text[:width - 1] + "…"
-
-
 class Player:
     """Synthesize chunks in a worker thread and play them through sounddevice,
     with a cursor we control for pause, ±15s seek, and paragraph jumps.
@@ -349,17 +421,21 @@ class Player:
 
     # --- worker threads ----------------------------------------------------- #
     def _synth_worker(self):
-        for chunk in self.chunks:
+        for seg in self.chunks:
             if self.quit.is_set():
                 break
-            audio, sr = synth(self.model, chunk, self.voice, self.speed,
+            audio, sr = synth(self.model, seg.text, self.voice, self.speed,
                               self.lang_code)
             if self.quit.is_set():
                 break
-            if audio is not None:
+            if audio is None or len(audio) == 0:
+                # keep buffer parts 1:1 with segments so paragraph tracking
+                # stays correct even if a segment yields no audio
+                audio = np.zeros(int(0.1 * self.sr), dtype=np.float32)
+            else:
                 self.sr = sr
-                self.buf.append(audio.astype(np.float32))
-                self.started.set()
+            self.buf.append(audio.astype(np.float32))
+            self.started.set()
         self.buf.mark_done()
         self.started.set()
 
@@ -458,6 +534,24 @@ class Player:
                 f"¶ {idx}/{len(self.chunks)}  {bar}  "
                 f"{_fmt_time(cur)} / {_fmt_time(total)}{tail}")
 
+    @staticmethod
+    def _term_width():
+        return min(shutil.get_terminal_size((80, 24)).columns, 100)
+
+    def _render_segment(self, seg):
+        """Format the now-playing segment for the read-along display."""
+        width = self._term_width()
+        if seg.kind == "heading":
+            body = textwrap.fill(seg.text, width)
+            return f"\n\x1b[1;36m{body}\x1b[0m"          # blank line + bold cyan
+        if seg.kind == "list":
+            body = textwrap.fill(seg.text, max(20, width - 4),
+                                 subsequent_indent="    ")
+            return f"  \x1b[33m•\x1b[0m {body}"
+        if seg.kind == "code":
+            return "\x1b[2m[code block omitted]\x1b[0m"
+        return textwrap.fill(seg.text, width)
+
     def _emit_status(self):
         with self.out_lock:
             sys.stdout.write("\r\x1b[K" + self._status_line())
@@ -510,8 +604,7 @@ class Player:
                 idx = self.buf.chunk_at(self._get_cursor())
                 if idx != last_idx:
                     last_idx = idx
-                    self._log(f"¶ {idx + 1}/{len(self.chunks)}  "
-                              f"{_preview(self.chunks[idx])}")
+                    self._log(self._render_segment(self.chunks[idx]))
                 self._emit_status()
                 self.quit.wait(0.15)
         finally:
@@ -534,13 +627,13 @@ class Player:
             self.quit.wait(0.2)
 
 
-def save_to_file(model, chunks, voice, speed, lang_code, out_path):
-    n = len(chunks)
+def save_to_file(model, segments, voice, speed, lang_code, out_path):
+    n = len(segments)
     pieces, sr = [], None
     try:
-        for i, chunk in enumerate(chunks):
+        for i, seg in enumerate(segments):
             print(f"\r♪ synthesizing chunk {i + 1}/{n}", end="", flush=True)
-            audio, csr = synth(model, chunk, voice, speed, lang_code)
+            audio, csr = synth(model, seg.text, voice, speed, lang_code)
             if audio is not None:
                 pieces.append(audio)
                 sr = csr
@@ -633,24 +726,24 @@ def resolve_text(args):
     if args.text:
         if args.pages:
             err("--pages only applies to PDF files")
-        return args.text
+        return args.text, False
     if args.clipboard:
         if args.pages:
             err("--pages only applies to PDF files")
-        return text_from_clipboard()
+        return text_from_clipboard(), False
 
     src = args.source
     if src.startswith(("http://", "https://")):
         if args.pages:
             err("--pages only applies to PDF files")
-        return text_from_url(src)
+        return text_from_url(src), True   # web extraction keeps markdown
     if src.lower().endswith(".pdf") or os.path.isfile(src):
         if not os.path.isfile(src):
             err(f"file not found: {src}")
         if not src.lower().endswith(".pdf"):
             err(f"only .pdf files are supported (got: {src})")
         pages = parse_pages(args.pages) if args.pages else None
-        return text_from_pdf(src, pages)
+        return text_from_pdf(src, pages), False
     err(f"don't know how to read {src!r} — expected a URL or a .pdf path")
 
 
@@ -666,16 +759,17 @@ def main():
 
     lang_code = args.voice[0] if args.voice else "a"
 
-    text = resolve_text(args)
-    chunks = chunk_text(text)
-    if not chunks:
+    text, is_markdown = resolve_text(args)
+    segments = segment_text(text, is_markdown)
+    if not segments:
         err("no readable text after extraction")
 
-    words = len(text.split())
+    spoken = " ".join(s.text for s in segments)
+    words = len(spoken.split())
     est_sec = words / WORDS_PER_SEC / args.speed
     mins, secs = divmod(int(est_sec), 60)
-    print(f"Text: {len(text):,} chars · {words:,} words · "
-          f"{len(chunks)} chunks · ~{mins}m{secs:02d}s of audio "
+    print(f"Text: {len(spoken):,} chars · {words:,} words · "
+          f"{len(segments)} chunks · ~{mins}m{secs:02d}s of audio "
           f"(voice {args.voice}, speed {args.speed})")
 
     model = load_model_quiet()
@@ -688,9 +782,10 @@ def main():
                                 lang_code=lang_code))
 
     if args.save:
-        save_to_file(model, chunks, args.voice, args.speed, lang_code, args.save)
+        save_to_file(model, segments, args.voice, args.speed, lang_code,
+                     args.save)
     else:
-        Player(model, chunks, args.voice, args.speed, lang_code,
+        Player(model, segments, args.voice, args.speed, lang_code,
                est_sec).run()
 
 
