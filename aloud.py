@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-read — a local, offline text-to-speech reader for the Mac.
+aloud — a local, offline text-to-speech reader for the Mac.
 
 Reads web articles, PDF sections, clipboard text, or literal strings aloud
 using Kokoro TTS (mlx-community/Kokoro-82M-bf16) via MLX-Audio on Apple Silicon.
@@ -58,7 +58,7 @@ WORDS_PER_SEC = 2.5      # rough Kokoro speaking rate at speed 1.0, for estimate
 
 def err(msg):
     """Print a clean one-line error and exit (no stack trace)."""
-    print(f"reader: {msg}", file=sys.stderr)
+    print(f"aloud: {msg}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -771,17 +771,17 @@ def list_voices():
 # --------------------------------------------------------------------------- #
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="reader",
+        prog="aloud",
         description="Local offline TTS reader (Kokoro via MLX-Audio).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
-            "  reader https://example.com/article\n"
-            "  reader paper.pdf --pages 3-7\n"
-            "  reader --text \"hello world\" --voice af_heart\n"
-            "  reader --clipboard --speed 1.2\n"
-            "  reader report.pdf --save out.wav\n"
-            "  reader --list-voices\n"
+            "  aloud https://example.com/article\n"
+            "  aloud paper.pdf --pages 3-7\n"
+            "  aloud --text \"hello world\" --voice af_heart\n"
+            "  aloud --clipboard --speed 1.2\n"
+            "  aloud report.pdf --save out.wav\n"
+            "  aloud --list-voices\n"
         ),
     )
     p.add_argument("source", nargs="?", help="a URL or a .pdf file path")
@@ -804,7 +804,7 @@ def resolve_text(args):
     sources = sum(bool(x) for x in (args.source, args.text, args.clipboard))
     if sources == 0:
         err("nothing to read — give a URL/PDF, --text, or --clipboard "
-            "(see: reader --help)")
+            "(see: aloud --help)")
     if sources > 1:
         err("choose only one of: URL/PDF, --text, --clipboard")
 
