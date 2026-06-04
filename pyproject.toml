@@ -1,0 +1,26 @@
+[project]
+name = "kokoro-reader"
+version = "0.1.0"
+description = "Local offline text-to-speech reader using Kokoro TTS via MLX-Audio"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "mlx-audio",
+    # Kokoro G2P (English) without the heavy transformer/torch stack:
+    "misaki",
+    "spacy",
+    "num2words",
+    # espeak-ng fallback so out-of-dictionary words (proper nouns/acronyms)
+    # are pronounced instead of skipped:
+    "espeakng-loader",
+    "phonemizer-fork",
+    # spaCy English model misaki needs for tokenization (not on PyPI):
+    "en-core-web-sm",
+    "trafilatura",
+    "pypdf",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }

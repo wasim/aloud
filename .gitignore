@@ -1,0 +1,15 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.python-version
+
+# Generated audio
+*.wav
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
