@@ -44,6 +44,7 @@ logging.getLogger("phonemizer").addFilter(_DropPhonemizerNoise())
 MODEL_ID = "mlx-community/Kokoro-82M-bf16"
 DEFAULT_VOICE = "af_bella"
 MAX_CHARS = 500          # target characters per synthesis chunk
+FIRST_CHARS = 120        # tiny first chunk so audio starts fast
 SEEK_BIG = 10            # j / l jump (seconds), YouTube-style
 SEEK_SMALL = 5           # ← / → jump (seconds), YouTube-style
 BLOCK = 2048             # audio frames written per loop (~85 ms at 24 kHz)
@@ -265,19 +266,52 @@ def segment_text(text, is_markdown, limit=MAX_CHARS):
     return segments
 
 
+def shrink_first_segment(segments):
+    """Split a short lead off the first paragraph so the very first synthesis
+    call is tiny and audio starts as soon as possible."""
+    if segments and segments[0].kind == "para" and len(segments[0].text) > FIRST_CHARS:
+        head, *rest = split_paragraph(segments[0].text, FIRST_CHARS)
+        tail = split_paragraph(" ".join(rest), MAX_CHARS) if rest else []
+        segments[0:1] = [Segment(p, "para") for p in (head, *tail)]
+    return segments
+
+
 # --------------------------------------------------------------------------- #
 # Synthesis & audio
 # --------------------------------------------------------------------------- #
-def load_model_quiet():
+def start_model_load(voice, speed, lang_code):
+    """Load and warm up the model in a background thread so it overlaps
+    fetching and segmenting the text. Returns a function that joins and
+    yields the ready model.
+
+    The warm-up generate also forces the lazily-loaded weights concrete;
+    MLX lazy arrays can only be evaluated on the thread that created them,
+    so without it the synth worker thread would crash (mlx#3529)."""
     print("Loading Kokoro model (first run downloads ~330 MB, then it's offline)…",
           flush=True)
-    try:
-        with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
-            from mlx_audio.tts.utils import load_model
-            model = load_model(MODEL_ID)
-    except Exception as e:
-        err(f"could not load model {MODEL_ID}: {e}")
-    return model
+    box = {}
+
+    def work():
+        try:
+            with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
+                from mlx_audio.tts.utils import load_model
+                model = load_model(MODEL_ID)
+                list(model.generate(text="ready", voice=voice, speed=speed,
+                                    lang_code=lang_code))
+                box["model"] = model
+        except Exception as e:
+            box["error"] = e
+
+    thread = threading.Thread(target=work, daemon=True)
+    thread.start()
+
+    def get_model():
+        thread.join()
+        if "error" in box:
+            err(f"could not load model {MODEL_ID}: {box['error']}")
+        return box["model"]
+
+    return get_model
 
 
 def synth(model, text, voice, speed, lang_code):
@@ -303,20 +337,26 @@ def write_wav(path, audio, sr):
 # Streaming playback with interactive controls
 # --------------------------------------------------------------------------- #
 class AudioBuffer:
-    """A growing in-memory stream of synthesized chunks.
+    """A growing in-memory stream of synthesized audio.
 
-    The synth worker appends chunk audio as it's produced; the playback thread
-    reads arbitrary sample windows (for seeking). All audio lives in RAM — a
-    15-minute article is well under 100 MB at 24 kHz mono float32 — so seeking
-    backward is always instant and playback never touches disk.
+    The synth worker marks where each segment (paragraph) begins and appends
+    audio pieces as the model yields them; the playback thread reads arbitrary
+    sample windows (for seeking). All audio lives in RAM — a 15-minute article
+    is well under 100 MB at 24 kHz mono float32 — so seeking backward is always
+    instant and playback never touches disk.
     """
 
     def __init__(self):
-        self.parts = []        # list[np.ndarray]
+        self.parts = []        # list[np.ndarray], in append order
         self.starts = []       # cumulative start sample of each part
+        self.seg_starts = []   # start sample of each segment (paragraph)
         self.total = 0         # samples synthesized so far
-        self.done = False      # all chunks synthesized
+        self.done = False      # all segments synthesized
         self.lock = threading.Lock()
+
+    def begin_segment(self):
+        with self.lock:
+            self.seg_starts.append(self.total)
 
     def append(self, arr):
         with self.lock:
@@ -332,28 +372,31 @@ class AudioBuffer:
         with self.lock:
             return self.total
 
-    def num_chunks(self):
+    def num_segments(self):
         with self.lock:
-            return len(self.parts)
+            return len(self.seg_starts)
 
-    def chunk_at(self, pos):
+    def segment_at(self, pos):
         with self.lock:
-            if not self.starts:
+            if not self.seg_starts:
                 return 0
-            i = bisect.bisect_right(self.starts, pos) - 1
-            return max(0, min(i, len(self.parts) - 1))
+            i = bisect.bisect_right(self.seg_starts, pos) - 1
+            return max(0, min(i, len(self.seg_starts) - 1))
 
-    def chunk_start(self, idx):
+    def segment_start(self, idx):
         with self.lock:
-            if 0 <= idx < len(self.starts):
-                return self.starts[idx]
+            if 0 <= idx < len(self.seg_starts):
+                return self.seg_starts[idx]
             return 0
 
-    def part_length(self, idx):
+    def segment_length(self, idx):
+        """Samples in segment idx so far (grows while it's still streaming)."""
         with self.lock:
-            if 0 <= idx < len(self.parts):
-                return len(self.parts[idx])
-            return 0
+            if not 0 <= idx < len(self.seg_starts):
+                return 0
+            end = (self.seg_starts[idx + 1] if idx + 1 < len(self.seg_starts)
+                   else self.total)
+            return end - self.seg_starts[idx]
 
     def get_block(self, pos, n):
         """Return (block, at_end). block is None when pos is past the
@@ -431,21 +474,25 @@ class Player:
 
     # --- worker threads ----------------------------------------------------- #
     def _synth_worker(self):
-        for seg in self.chunks:
+        for i, seg in enumerate(self.chunks):
             if self.quit.is_set():
                 break
-            audio, sr = synth(self.model, seg.text, self.voice, self.speed,
-                              self.lang_code)
-            if self.quit.is_set():
-                break
-            if audio is None or len(audio) == 0:
-                # keep buffer parts 1:1 with segments so paragraph tracking
-                # stays correct even if a segment yields no audio
-                audio = np.zeros(int(0.1 * self.sr), dtype=np.float32)
-            else:
-                self.sr = sr
-            self.buf.append(audio.astype(np.float32))
-            self.started.set()
+            self.buf.begin_segment()
+            # Append pieces as the model yields them so playback can start
+            # before the whole segment is synthesized.
+            for r in self.model.generate(text=seg.text, voice=self.voice,
+                                         speed=self.speed,
+                                         lang_code=self.lang_code):
+                if self.quit.is_set():
+                    break
+                audio = np.asarray(r.audio, dtype=np.float32).reshape(-1)
+                if len(audio):
+                    self.sr = r.sample_rate
+                    self.buf.append(audio)
+                    self.started.set()
+            if self.buf.segment_length(i) == 0:
+                # keep every segment non-empty so paragraph tracking works
+                self.buf.append(np.zeros(int(0.1 * self.sr), dtype=np.float32))
         self.buf.mark_done()
         self.started.set()
 
@@ -505,9 +552,9 @@ class Player:
             self._seek_to(0)
 
     def _jump_paragraph(self, direction):
-        idx = self.buf.chunk_at(self._get_cursor()) + direction
-        idx = max(0, min(idx, self.buf.num_chunks() - 1))
-        self._seek_to(self.buf.chunk_start(idx))
+        idx = self.buf.segment_at(self._get_cursor()) + direction
+        idx = max(0, min(idx, self.buf.num_segments() - 1))
+        self._seek_to(self.buf.segment_start(idx))
 
     def _read_key(self, fd):
         if not select.select([fd], [], [], 0.2)[0]:
@@ -540,7 +587,7 @@ class Player:
         bar = "█" * fill + "░" * (24 - fill)
         state = "End    " if self.at_end else ("Paused " if self.paused
                                                else "Playing")
-        idx = self.buf.chunk_at(pos) + 1
+        idx = self.buf.segment_at(pos) + 1
         tail = "" if self.buf.done else " +"   # synthesis still running
         return (f"{'❚❚' if self.paused else '▶'}  {state}  "
                 f"¶ {idx}/{len(self.chunks)}  {bar}  "
@@ -588,29 +635,11 @@ class Player:
         nwords = len(seg.text.split())
         if nwords == 0 or seg.kind != "para":
             return None
-        length = self.buf.part_length(idx)
+        length = self.buf.segment_length(idx)
         if length <= 0:
             return 0
-        frac = (self._get_cursor() - self.buf.chunk_start(idx)) / length
+        frac = (self._get_cursor() - self.buf.segment_start(idx)) / length
         return max(0, min(nwords - 1, int(frac * nwords)))
-
-    def _status_line(self):
-        pos = self._get_cursor()
-        cur = pos / self.sr
-        if self.buf.done:
-            total = self.buf.synth_total() / self.sr
-        else:
-            total = max(self.est_total_sec, cur)
-        frac = 0.0 if total <= 0 else max(0.0, min(1.0, cur / total))
-        fill = int(frac * 24)
-        bar = "█" * fill + "░" * (24 - fill)
-        state = "End    " if self.at_end else ("Paused " if self.paused
-                                               else "Playing")
-        idx = self.buf.chunk_at(pos) + 1
-        tail = "" if self.buf.done else " +"   # synthesis still running
-        return (f"{'❚❚' if self.paused else '▶'}  {state}  "
-                f"¶ {idx}/{len(self.chunks)}  {bar}  "
-                f"{_fmt_time(cur)} / {_fmt_time(total)}{tail}")
 
     def _paint(self, idx):
         """Redraw the live region (current paragraph + status) in place."""
@@ -684,7 +713,7 @@ class Player:
             kb = threading.Thread(target=self._keyboard, args=(fd,), daemon=True)
             kb.start()
             while not self.quit.is_set():
-                idx = self.buf.chunk_at(self._get_cursor())
+                idx = self.buf.segment_at(self._get_cursor())
                 if idx != last_idx:
                     if last_idx != -1:
                         self._commit(last_idx)   # finished paragraph -> scrollback
@@ -702,7 +731,7 @@ class Player:
         # No TTY (piped/redirected): just stream to the end with chunk progress.
         last_idx = -1
         while not self.quit.is_set():
-            idx = self.buf.chunk_at(self._get_cursor())
+            idx = self.buf.segment_at(self._get_cursor())
             if idx != last_idx:
                 last_idx = idx
                 print(f"chunk {idx + 1}/{len(self.chunks)}", flush=True)
@@ -844,8 +873,12 @@ def main():
 
     lang_code = args.voice[0] if args.voice else "a"
 
+    # Start loading and warming up the model now so it overlaps the fetch
+    # and segmenting work below.
+    get_model = start_model_load(args.voice, args.speed, lang_code)
+
     text, is_markdown = resolve_text(args)
-    segments = segment_text(text, is_markdown)
+    segments = shrink_first_segment(segment_text(text, is_markdown))
     if not segments:
         err("no readable text after extraction")
 
@@ -857,14 +890,7 @@ def main():
           f"{len(segments)} chunks · ~{mins}m{secs:02d}s of audio "
           f"(voice {args.voice}, speed {args.speed})")
 
-    model = load_model_quiet()
-
-    # Warm up once: triggers (and silences) pipeline creation and compiles
-    # Metal kernels so the first real chunk starts almost immediately.
-    with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull):
-        with contextlib.suppress(Exception):
-            list(model.generate(text="ready", voice=args.voice, speed=args.speed,
-                                lang_code=lang_code))
+    model = get_model()
 
     if args.save:
         save_to_file(model, segments, args.voice, args.speed, lang_code,
